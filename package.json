@@ -10,7 +10,7 @@
     },
     "scripts": {
         "start": "node main.js",
-        "test": "echo \"Error: oops, the actor has no tests yet, sad!\" && exit 1"
+        "test": "node --test --test-concurrency=1"
     },
     "author": "It's not you it's me",
     "license": "ISC"
