@@ -6,6 +6,8 @@ import {
     PuppeteerCrawler,
     log as defaultLogger,
 } from 'crawlee';
+import { openTransientQueue } from './transient-queue.js';
+import { monitorDocumentSize } from './response-limit.js';
 
 const LATENCY_SAMPLE_LIMIT = 200;
 
@@ -41,7 +43,7 @@ export function createFetchService(
     { logger = defaultLogger } = {},
 ) {
     const jobs = new Map();
-    const waitingJobIds = [];
+    const waitingJobIds = new Set();
     const drainWaiters = new Set();
     const metrics = createMetrics();
 
@@ -54,6 +56,8 @@ export function createFetchService(
     let runtimeError = null;
     let shutdownPromise;
     let shuttingDown = false;
+    let draining = false;
+    const crawlerConfiguration = new Configuration({ persistStorage: false });
 
     const proxyConfiguration = config.proxyUrls.length > 0
         ? new ProxyConfiguration({ proxyUrls: config.proxyUrls })
@@ -67,6 +71,9 @@ export function createFetchService(
             log: crawlerLogger,
             keepAlive: true,
             maxConcurrency: config.maxConcurrency,
+            autoscaledPoolOptions: {
+                desiredConcurrency: Math.min(config.maxConcurrency, config.maxPendingRequests),
+            },
             maxRequestRetries: 1,
             maxSessionRotations: 2,
             proxyConfiguration,
@@ -105,7 +112,7 @@ export function createFetchService(
             requestHandler: handleCrawlerRequest,
             failedRequestHandler: handleFailedCrawlerRequest,
         },
-        new Configuration({ persistStorage: false }),
+        crawlerConfiguration,
     );
 
     const server = createServer((request, response) => {
@@ -128,6 +135,7 @@ export function createFetchService(
         15_000,
     );
     server.keepAliveTimeout = 5_000;
+    server.timeout = config.apiTimeoutMs + 5_000;
     server.maxRequestsPerSocket = 100;
 
     server.on('clientError', (error, socket) => {
@@ -164,6 +172,7 @@ export function createFetchService(
         isStarted = true;
 
         try {
+            crawler.requestQueue = await openTransientQueue(crawlerConfiguration);
             await listen(server, config.port, config.host);
         } catch (error) {
             crawlerState = 'failed';
@@ -231,6 +240,7 @@ export function createFetchService(
     async function performShutdown(signal, drain) {
         shuttingDown = true;
         crawlerState = 'stopping';
+        draining = drain;
 
         logger.info(`Received ${signal}; shutting down`, {
             drain,
@@ -244,10 +254,13 @@ export function createFetchService(
         let drained = jobs.size === 0;
 
         if (drain && !drained) {
+            scheduleQueuePump();
             drained = await waitForJobsToDrain(
                 config.shutdownTimeoutMs,
             );
         }
+
+        draining = false;
 
         if (!drained) {
             logger.warning('Shutdown drain deadline reached', {
@@ -281,10 +294,14 @@ export function createFetchService(
     }
 
     async function handleHttpRequest(request, response) {
-        const requestUrl = new URL(
-            request.url || '/',
-            `http://${config.host}:${config.port}`,
-        );
+        let requestUrl;
+        try {
+            // The bind address can be IPv6; it is not a URL parsing base.
+            requestUrl = new URL(request.url || '/', 'http://localhost');
+        } catch {
+            sendJsonSafely(response, 400, { error: 'Invalid request URL' });
+            return;
+        }
 
         if (
             requestUrl.pathname === '/health'
@@ -405,6 +422,7 @@ export function createFetchService(
             crawlerRequest: null,
             page: null,
             responseListener: null,
+            stopSizeMonitor: null,
             latestNavigationResponse: null,
             timer: null,
             removeDisconnectListeners: null,
@@ -427,7 +445,7 @@ export function createFetchService(
         }, config.apiTimeoutMs);
 
         jobs.set(id, job);
-        waitingJobIds.push(id);
+        waitingJobIds.add(id);
         metrics.requests.accepted += 1;
 
         logger.info('Fetch request accepted', {
@@ -515,10 +533,14 @@ export function createFetchService(
         });
     }
 
+    function canPumpQueue() {
+        return crawlerState === 'running' || (crawlerState === 'stopping' && draining);
+    }
+
     async function pumpQueue() {
         if (
             isPumping
-            || crawlerState !== 'running'
+            || !canPumpQueue()
         ) {
             return;
         }
@@ -528,10 +550,11 @@ export function createFetchService(
         try {
             while (
                 activeCrawlerJobs < config.maxConcurrency
-                && waitingJobIds.length > 0
-                && crawlerState === 'running'
+                && waitingJobIds.size > 0
+                && canPumpQueue()
             ) {
-                const id = waitingJobIds.shift();
+                const id = waitingJobIds.values().next().value;
+                waitingJobIds.delete(id);
                 const job = jobs.get(id);
 
                 if (!job || job.settled) {
@@ -596,8 +619,8 @@ export function createFetchService(
 
             if (
                 activeCrawlerJobs < config.maxConcurrency
-                && waitingJobIds.length > 0
-                && crawlerState === 'running'
+                && waitingJobIds.size > 0
+                && canPumpQueue()
             ) {
                 scheduleQueuePump();
             }
@@ -643,6 +666,23 @@ export function createFetchService(
 
         job.responseListener = responseListener;
         page.on('response', responseListener);
+        job.stopSizeMonitor = await monitorDocumentSize(
+            page,
+            config.maxResponseBytes,
+            () => {
+                if (job.httpDone || job.settled) return;
+                finishHttpResponse(job, 502, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                }, JSON.stringify({
+                    success: false,
+                    requestId: job.id,
+                    code: 'UPSTREAM_RESPONSE_TOO_LARGE',
+                    error: `Upstream response exceeds the ${config.maxResponseBytes}-byte limit`,
+                }), 'response_too_large');
+                cancelCrawlerWork(job);
+            },
+        );
+        ensureJobIsActive(job);
         gotoOptions.waitUntil = 'domcontentloaded';
         gotoOptions.timeout = getRemainingTime(job);
     }
@@ -795,11 +835,7 @@ export function createFetchService(
 
         const isChallengePage =
             responseHeaders['x-gatekeeper-challenge'] === 'required'
-            || pageState.title === '正在验证浏览器'
-            || (
-                pageState.hasStatusElement
-                && pageState.bodyState
-            );
+            || pageState.title === '正在验证浏览器';
 
         if (!isChallengePage) {
             return false;
@@ -945,6 +981,7 @@ export function createFetchService(
         job.removeDisconnectListeners?.();
         detachPageTracking(job);
         jobs.delete(job.id);
+        waitingJobIds.delete(job.id);
 
         if (job.submitted) {
             activeCrawlerJobs = Math.max(0, activeCrawlerJobs - 1);
@@ -961,6 +998,8 @@ export function createFetchService(
     }
 
     function detachPageTracking(job) {
+        job.stopSizeMonitor?.();
+        job.stopSizeMonitor = null;
         if (job.page && job.responseListener) {
             job.page.off('response', job.responseListener);
         }
@@ -1089,6 +1128,8 @@ export function createFetchService(
             capacity: config.maxPendingRequests,
             crawlerSlotsInUse: activeCrawlerJobs,
             crawlerSlotCapacity: config.maxConcurrency,
+            crawlerActiveConcurrency: crawler.autoscaledPool?.currentConcurrency ?? 0,
+            crawlerDesiredConcurrency: crawler.autoscaledPool?.desiredConcurrency ?? 0,
         };
     }
 
@@ -1377,7 +1418,7 @@ function formatUrlForLogs(url) {
 
 function describeError(error) {
     if (!(error instanceof Error)) {
-        return String(error || 'Unknown error');
+        return redactUrls(String(error || 'Unknown error'));
     }
 
     return {

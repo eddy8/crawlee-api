@@ -110,7 +110,7 @@ after(async () => {
         await waitForExit(application);
     }
 
-    if (upstream) {
+    if (upstream?.listening) {
         await closeServer(upstream);
     }
 });
@@ -337,6 +337,42 @@ function applicationUrl(pathname) {
     return `http://127.0.0.1:${applicationPort}${pathname}`;
 }
 
+test('SIGINT cancels in-flight work promptly and exits cleanly', async () => {
+    const port = await reservePort();
+    const child = spawn(process.execPath, ['main.js'], {
+        cwd: projectDirectory,
+        env: {
+            ...process.env, HOST: '127.0.0.1', PORT: String(port),
+            API_TIMEOUT_MS: '10000', SHUTDOWN_TIMEOUT_MS: '500',
+            MAX_CONCURRENCY: '1', MAX_PENDING_REQUESTS: '2',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
+    try {
+        await withTimeout(waitFor(async () => {
+            try { return (await fetch(`http://127.0.0.1:${port}/health/live`)).ok; }
+            catch { return false; }
+        }), 10_000, 'SIGINT service did not start');
+        const started = slowRequestsStarted;
+        const pending = fetch(`http://127.0.0.1:${port}/fetch?${new URLSearchParams({ url: upstreamUrl('/slow') })}`);
+        await withTimeout(waitFor(() => slowRequestsStarted > started), 3000, 'SIGINT request did not start');
+        child.kill('SIGINT');
+        const response = await pending;
+        assert.equal(response.status, 503);
+        assert.equal((await response.json()).code, 'SERVICE_SHUTTING_DOWN');
+        const exit = await withTimeout(waitForExit(child), 2000, 'SIGINT service did not exit');
+        assert.equal(exit.code, 0, output);
+    } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+            child.kill('SIGKILL');
+            await waitForExit(child);
+        }
+    }
+});
+
 function upstreamUrl(pathname) {
     return `http://127.0.0.1:${upstreamPort}${pathname}`;
 }
@@ -420,7 +456,7 @@ function closeServer(server) {
 }
 
 function waitForExit(child) {
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
         return Promise.resolve({
             code: child.exitCode,
             signal: child.signalCode,
