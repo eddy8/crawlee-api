@@ -10,6 +10,14 @@ import { openTransientQueue } from './transient-queue.js';
 import { monitorDocumentSize } from './response-limit.js';
 
 const LATENCY_SAMPLE_LIMIT = 200;
+// AutoscaledPool is not woken by addRequests(); an idle slot only picks up new
+// work on this tick. Crawlee's 0.5 s default adds ~250 ms mean latency per API call.
+const CRAWLER_TASK_POLL_INTERVAL_SECS = 0.05;
+// Crawlee's default (0.25 of total memory, including Chromium child processes)
+// marks a browser service as overloaded early and silently lowers concurrency
+// below the service's own slot accounting. The limit is cgroup-aware; operators
+// can override it with CRAWLEE_MEMORY_MBYTES or CRAWLEE_AVAILABLE_MEMORY_RATIO.
+const DEFAULT_AVAILABLE_MEMORY_RATIO = 0.8;
 
 class RequestCancelledError extends Error {
     constructor(message = 'Crawler request was cancelled') {
@@ -56,8 +64,16 @@ export function createFetchService(
     let runtimeError = null;
     let shutdownPromise;
     let shuttingDown = false;
+    // Set as soon as shutdown is requested; readiness fails while /fetch is
+    // still served during SHUTDOWN_DELAY_MS.
+    let shutdownAnnounced = false;
     let draining = false;
-    const crawlerConfiguration = new Configuration({ persistStorage: false });
+    let stallWatchdog = null;
+    let stallReported = false;
+    const crawlerConfiguration = new Configuration({
+        persistStorage: false,
+        availableMemoryRatio: DEFAULT_AVAILABLE_MEMORY_RATIO,
+    });
 
     const proxyConfiguration = config.proxyUrls.length > 0
         ? new ProxyConfiguration({ proxyUrls: config.proxyUrls })
@@ -73,6 +89,16 @@ export function createFetchService(
             maxConcurrency: config.maxConcurrency,
             autoscaledPoolOptions: {
                 desiredConcurrency: Math.min(config.maxConcurrency, config.maxPendingRequests),
+                maybeRunIntervalSecs: CRAWLER_TASK_POLL_INTERVAL_SECS,
+            },
+            browserPoolOptions: {
+                /*
+                 * browser-pool retires a browser after 10 s without new pages,
+                 * so the next API call after a short lull pays a Chromium cold
+                 * start. Keep the warm browser; retireBrowserAfterPageCount
+                 * still recycles it periodically.
+                 */
+                retireInactiveBrowserAfterSecs: config.browserIdleTimeoutSecs,
             },
             maxRequestRetries: 1,
             maxSessionRotations: 2,
@@ -134,22 +160,43 @@ export function createFetchService(
         server.requestTimeout,
         15_000,
     );
-    server.keepAliveTimeout = 5_000;
+    // Must outlive the idle timeout of upstream proxies/load balancers
+    // (ALB and nginx default to 60 s), otherwise reused connections race
+    // with this server closing them and surface as sporadic 502s.
+    server.keepAliveTimeout = config.keepAliveTimeoutMs;
     server.timeout = config.apiTimeoutMs + 5_000;
     server.maxRequestsPerSocket = 100;
 
     server.on('clientError', (error, socket) => {
+        const code = error?.code;
+
+        // With a clientError listener installed Node no longer cleans the
+        // socket up itself, so every branch must end in destroy().
+        if (
+            code === 'ECONNRESET'
+            || code === 'EPIPE'
+            || !socket.writable
+        ) {
+            logger.debug('HTTP client connection closed abruptly', {
+                code,
+            });
+            socket.destroy();
+            return;
+        }
+
+        const status = selectClientErrorStatus(code);
         logger.warning('HTTP client error', {
+            code,
+            status,
             error: describeError(error),
         });
-
-        if (socket.writable) {
-            socket.end(
-                'HTTP/1.1 400 Bad Request\r\n'
-                + 'Connection: close\r\n'
-                + '\r\n',
-            );
-        }
+        socket.end(
+            `HTTP/1.1 ${status}\r\n`
+            + 'Connection: close\r\n'
+            + 'Content-Length: 0\r\n'
+            + '\r\n',
+            () => socket.destroy(),
+        );
     });
 
     server.on('error', (error) => {
@@ -190,6 +237,9 @@ export function createFetchService(
             (error) => ({ error }),
         );
 
+        stallWatchdog = setInterval(checkForStalledJobs, 5_000);
+        stallWatchdog.unref();
+
         logger.info(
             `Fetch service listening on http://${config.host}:${config.port}`,
         );
@@ -198,6 +248,13 @@ export function createFetchService(
             maxConcurrency: config.maxConcurrency,
             maxPendingRequests: config.maxPendingRequests,
             maxResponseBytes: config.maxResponseBytes,
+            browserIdleTimeoutSecs: config.browserIdleTimeoutSecs,
+            keepAliveTimeoutMs: config.keepAliveTimeoutMs,
+            shutdownDelayMs: config.shutdownDelayMs,
+            jobStallGraceMs: config.jobStallGraceMs,
+            memoryLimit: crawlerConfiguration.get('memoryMbytes')
+                ? `${crawlerConfiguration.get('memoryMbytes')} MB`
+                : `${crawlerConfiguration.get('availableMemoryRatio')} of available memory`,
             proxyEnabled: Boolean(proxyConfiguration),
             shutdownTimeoutMs: config.shutdownTimeoutMs,
         });
@@ -238,9 +295,30 @@ export function createFetchService(
     }
 
     async function performShutdown(signal, drain) {
+        shutdownAnnounced = true;
+
+        /*
+         * Orchestrators keep routing to an instance for a few seconds after
+         * SIGTERM while endpoint removal propagates. Fail readiness first and
+         * keep serving, then stop accepting. SIGINT is excluded because
+         * Crawlee aborts its pool on SIGINT by itself.
+         */
+        if (
+            drain
+            && signal === 'SIGTERM'
+            && config.shutdownDelayMs > 0
+            && crawlerState === 'running'
+        ) {
+            logger.info(`Received ${signal}; failing readiness before shutdown`, {
+                delayMs: config.shutdownDelayMs,
+            });
+            await delay(config.shutdownDelayMs);
+        }
+
         shuttingDown = true;
         crawlerState = 'stopping';
         draining = drain;
+        clearInterval(stallWatchdog);
 
         logger.info(`Received ${signal}; shutting down`, {
             drain,
@@ -299,8 +377,14 @@ export function createFetchService(
             // The bind address can be IPv6; it is not a URL parsing base.
             requestUrl = new URL(request.url || '/', 'http://localhost');
         } catch {
+            response.setHeader('Connection', 'close');
             sendJsonSafely(response, 400, { error: 'Invalid request URL' });
             return;
+        }
+
+        if (shuttingDown) {
+            // Let keep-alive clients reconnect to an instance that stays up.
+            response.setHeader('Connection', 'close');
         }
 
         if (
@@ -317,10 +401,13 @@ export function createFetchService(
         }
 
         if (requestUrl.pathname === '/health/live') {
-            const live = crawlerState !== 'failed';
+            const stalled = checkForStalledJobs();
+            const live = crawlerState !== 'failed' && stalled.count === 0;
             sendJsonSafely(response, live ? 200 : 503, {
                 live,
                 state: crawlerState,
+                stalledJobs: stalled.count,
+                oldestStalledJobAgeMs: stalled.oldestAgeMs,
                 uptimeSeconds: getUptimeSeconds(),
                 timestamp: new Date().toISOString(),
             });
@@ -936,6 +1023,7 @@ export function createFetchService(
         const responseHeaders = {
             'Cache-Control': 'private, no-store',
             'X-Request-ID': job.id,
+            ...(shuttingDown ? { Connection: 'close' } : {}),
             ...headers,
         };
 
@@ -1073,9 +1161,11 @@ export function createFetchService(
     }
 
     function createRuntimeSnapshot() {
+        const stalled = checkForStalledJobs();
         const ready = (
             crawlerState === 'running'
-            && !shuttingDown
+            && !shutdownAnnounced
+            && stalled.count === 0
             && jobs.size < config.maxPendingRequests
         );
 
@@ -1105,6 +1195,38 @@ export function createFetchService(
         };
     }
 
+    /*
+     * A submitted job keeps its crawler slot until Crawlee reports back. If
+     * Crawlee wedges (hung page close, stuck browser launch, stalled pool),
+     * those slots never return and the service would stay "live" while
+     * rejecting all work. Report such jobs so liveness can restart us.
+     */
+    function checkForStalledJobs(now = Date.now()) {
+        let count = 0;
+        let oldestAgeMs = null;
+
+        for (const job of jobs.values()) {
+            if (job.submitted && now >= job.deadlineAt + config.jobStallGraceMs) {
+                count += 1;
+                oldestAgeMs = Math.max(oldestAgeMs ?? 0, now - job.acceptedAt);
+            }
+        }
+
+        if (count > 0 && !stallReported && !shuttingDown) {
+            stallReported = true;
+            logger.error('Crawler jobs are stalled past their deadline; failing liveness', {
+                stalledJobs: count,
+                oldestAgeMs,
+                jobStallGraceMs: config.jobStallGraceMs,
+            });
+        } else if (count === 0 && stallReported) {
+            stallReported = false;
+            logger.warning('Stalled crawler jobs have been released');
+        }
+
+        return { count, oldestAgeMs };
+    }
+
     function createJobsSnapshot() {
         let queued = 0;
         let running = 0;
@@ -1125,6 +1247,7 @@ export function createFetchService(
             queued,
             running,
             awaitingCleanup,
+            stalled: checkForStalledJobs().count,
             capacity: config.maxPendingRequests,
             crawlerSlotsInUse: activeCrawlerJobs,
             crawlerSlotCapacity: config.maxConcurrency,
@@ -1200,21 +1323,30 @@ async function readFinalResponseBody(
         normalizedType.includes('text/html')
         || normalizedType.includes('application/xhtml+xml')
     ) {
-        const renderedCharacterCount = await page.evaluate(() => (
-            document.documentElement?.outerHTML.length || 0
-        ));
+        // Serialize once, the same way page.content() does, and bail out in
+        // the page before transferring an oversized DOM over CDP.
+        const rendered = await page.evaluate((characterLimit) => {
+            let content = '';
 
-        if (renderedCharacterCount > maxResponseBytes) {
-            throw new ResponseTooLargeError(
-                renderedCharacterCount,
-                maxResponseBytes,
-            );
+            for (const node of document.childNodes) {
+                content += node === document.documentElement
+                    ? node.outerHTML
+                    : new XMLSerializer().serializeToString(node);
+
+                // UTF-8 needs at least one byte per UTF-16 code unit.
+                if (content.length > characterLimit) {
+                    return { content: null, tooLarge: true };
+                }
+            }
+
+            return { content, tooLarge: false };
+        }, maxResponseBytes);
+
+        if (rendered.tooLarge) {
+            throw new ResponseTooLargeError(null, maxResponseBytes);
         }
 
-        return assertBodyWithinLimit(
-            await page.content(),
-            maxResponseBytes,
-        );
+        return assertBodyWithinLimit(rendered.content, maxResponseBytes);
     }
 
     if (finalResponse) {
@@ -1293,6 +1425,18 @@ function selectOutputContentType(upstreamContentType) {
     }
 
     return 'text/html; charset=utf-8';
+}
+
+function selectClientErrorStatus(code) {
+    if (code === 'ERR_HTTP_REQUEST_TIMEOUT') {
+        return '408 Request Timeout';
+    }
+
+    if (code === 'HPE_HEADER_OVERFLOW') {
+        return '431 Request Header Fields Too Large';
+    }
+
+    return '400 Bad Request';
 }
 
 function createFinalUrlHeaders(finalUrl) {

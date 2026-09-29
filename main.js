@@ -2,6 +2,10 @@ import { log } from 'crawlee';
 import { loadConfig } from './src/config.js';
 import { createFetchService } from './src/fetch-service.js';
 
+// Time allowed after the drain deadline to stop the crawler, close Chromium
+// and flush responses before the process is killed.
+const TEARDOWN_BUDGET_MS = 10_000;
+
 const config = loadConfig();
 const service = createFetchService(config);
 
@@ -14,10 +18,11 @@ function handleSignal(signal) {
 
     handlingSignal = true;
 
+    const shutdownDelayMs = signal === 'SIGTERM' ? config.shutdownDelayMs : 0;
     const forceExitTimer = setTimeout(() => {
         log.error('Service exceeded its shutdown deadline');
         process.exit(1);
-    }, config.shutdownTimeoutMs + 1_000);
+    }, shutdownDelayMs + config.shutdownTimeoutMs + TEARDOWN_BUDGET_MS);
 
     void service.shutdown(signal).then(
         () => {
